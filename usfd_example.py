@@ -1,5 +1,5 @@
 from usfd_wear_model import USFDWearModel, WearCoefficients
-
+import matplotlib.pyplot as plt
 # Create USFD wear model with default coefficients
 usfd_model = USFDWearModel()
 
@@ -28,3 +28,4 @@ print(f"Material loss: {material_loss:.2f} μg over {distance} m")
 
 # Plot wear function
 usfd_model.plot_wear_function()
+plt.show()

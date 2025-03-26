@@ -1,4 +1,5 @@
 import numpy as np
+import matplotlib.pyplot as plt
 from kp_model import KpModel, WheelRailProfiles, MaterialProperties
 
 # Create wheel and rail profiles
@@ -48,3 +49,4 @@ print(f"Normal force: {results['normal_force']:.2f} N")
 
 # Plot results
 kp_model.plot_results(results)
+plt.show()

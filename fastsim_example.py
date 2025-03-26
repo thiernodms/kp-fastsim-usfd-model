@@ -1,4 +1,5 @@
 import numpy as np
+import matplotlib.pyplot as plt
 from fastsim import FASTSIM, ContactPatch, CreepageParameters, MaterialParameters
 
 # Define contact patch
@@ -36,3 +37,4 @@ print(f"Spin moment (Mz): {results['Mz']:.2f} N·m")
 
 # Plot results
 fastsim.plot_results()
+plt.show()
