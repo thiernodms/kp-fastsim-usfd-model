@@ -1,4 +1,5 @@
 import numpy as np
+import matplotlib.pyplot as plt
 import time
 
 class Inputs:
@@ -98,7 +99,20 @@ if __name__ == "__main__":
     fastsim.v1(0.4, 0.09)
     end_time = time.time()
 
-    elapsed_time = (end_time - start_time) * 1e6  # Convert to microseconds
+    elapsed_time = (end_time - start_time) * 1e6  # Convertir en microsecondes
+    
     print(f"Time elapsed: {elapsed_time:.2f} microseconds")
     print(f"Fx= {fastsim.T[0]}")
     print(f"Fy= {fastsim.T[1]}")
+
+    # Visualisation des résultats
+    labels = ['Fx', 'Fy']
+    values = [fastsim.T[0], fastsim.T[1]]
+
+    plt.figure(figsize=(6, 4))
+    plt.bar(labels, values, color=['blue', 'red'])
+    plt.xlabel("Forces")
+    plt.ylabel("Valeur")
+    plt.title("Visualisation des forces Fx et Fy")
+    plt.grid(axis='y', linestyle='--', alpha=0.7)
+    plt.show()
