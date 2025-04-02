@@ -11,6 +11,7 @@ References:
 import numpy as np
 import matplotlib.pyplot as plt
 from dataclasses import dataclass
+from scipy import interpolate, integrate
 
 
 @dataclass
@@ -39,7 +40,7 @@ class KpModel:
     Implementation of the Kik-Piotrowski non-Hertzian contact model.
     """
     
-    def __init__(self, profiles, material, penetration, yaw_angle=0.0, discretization=100):
+    def __init__(self, profiles, material, penetration, virtual_penetration=None, yaw_angle=0.0, discretization=100):
         """
         Initialize the Kp model.
         
@@ -47,12 +48,14 @@ class KpModel:
         profiles -- WheelRailProfiles object with wheel and rail geometry
         material -- MaterialProperties object with material properties
         penetration -- Penetration depth (m)
+        virtual_penetration -- Virtual penetration depth (m), if None, equals to penetration
         yaw_angle -- Yaw angle (rad)
         discretization -- Number of points for discretization
         """
         self.profiles = profiles
         self.material = material
         self.penetration = penetration
+        self.virtual_penetration = virtual_penetration if virtual_penetration is not None else penetration
         self.yaw_angle = yaw_angle
         self.discretization = discretization
         
@@ -62,16 +65,24 @@ class KpModel:
         self.pressure_distribution = None
         self.normal_force = None
         
+    def get_profiles(self):
+        """
+        Get wheel and rail profiles.
+        
+        Returns:
+        wheel_profile, rail_profile -- Arrays of wheel and rail profile coordinates
+        """
+        return self.profiles.wheel_profile, self.profiles.rail_profile
+    
     def equalize_profiles(self):
         """
         Ensure wheel and rail profiles have the same number of points
         and are properly aligned for comparison.
-        """
-        # This is a simplified implementation
-        # In a real application, this would involve interpolation and alignment
         
-        wheel = self.profiles.wheel_profile
-        rail = self.profiles.rail_profile
+        Returns:
+        wheel_profile_eq, rail_profile_eq -- Equalized wheel and rail profiles
+        """
+        wheel, rail = self.get_profiles()
         
         # Create common x-coordinates for both profiles
         x_min = max(np.min(wheel[:, 0]), np.min(rail[:, 0]))
@@ -80,14 +91,37 @@ class KpModel:
         x_common = np.linspace(x_min, x_max, self.discretization)
         
         # Interpolate wheel and rail profiles to common x-coordinates
-        wheel_y = np.interp(x_common, wheel[:, 0], wheel[:, 1])
-        rail_y = np.interp(x_common, rail[:, 0], rail[:, 1])
+        # Use scipy.interpolate for more accurate interpolation
+        wheel_interp = interpolate.interp1d(wheel[:, 0], wheel[:, 1], kind='linear')
+        rail_interp = interpolate.interp1d(rail[:, 0], rail[:, 1], kind='linear')
+        
+        wheel_y = wheel_interp(x_common)
+        rail_y = rail_interp(x_common)
         
         # Create new profile arrays
         wheel_profile_eq = np.column_stack((x_common, wheel_y))
         rail_profile_eq = np.column_stack((x_common, rail_y))
         
         return wheel_profile_eq, rail_profile_eq
+    
+    def separation_of_profiles(self, wheel_profile, rail_profile):
+        """
+        Compute distance between points of two profiles.
+        
+        Parameters:
+        wheel_profile -- Wheel profile coordinates
+        rail_profile -- Rail profile coordinates
+        
+        Returns:
+        separation -- Array of separation values
+        """
+        # Calculate vertical distance between profiles
+        sep = wheel_profile[:, 1] - rail_profile[:, 1]
+        
+        # Correct separation if profiles overlap or do not touch
+        min_sep = np.min(sep)
+        
+        return sep - min_sep
     
     def calculate_interpenetration(self, wheel_profile, rail_profile):
         """
@@ -100,16 +134,40 @@ class KpModel:
         Returns:
         interpenetration -- Array of interpenetration values
         """
-        # Calculate vertical distance between profiles
-        interpenetration = wheel_profile[:, 1] - rail_profile[:, 1]
+        # Calculate separation between profiles
+        sep = self.separation_of_profiles(wheel_profile, rail_profile)
         
-        # Apply global penetration
-        interpenetration += self.penetration
+        # Calculate interpenetration
+        interp_array = self.virtual_penetration - sep
         
         # Set negative values (no contact) to zero
-        interpenetration = np.maximum(interpenetration, 0)
+        for i, interp in enumerate(interp_array):
+            if interp > 0:
+                interp_array[i] = interp
+            else:
+                interp_array[i] = 0
         
-        return interpenetration
+        return interp_array
+    
+    def nonzero_runs(self, a):
+        """
+        Returns (n,2) array where n is number of runs of non-zeros.
+        The first column is the index of the first non-zero in each run,
+        and the second is the index of the first zero element after the run.
+        
+        Parameters:
+        a -- 1d array
+        
+        Returns:
+        ranges -- Array of run ranges
+        """
+        # Create an array that's 1 where a isn't 0, and pad each end with an extra 0
+        nonzero = np.concatenate(([0], np.not_equal(a, 0).view(np.int8), [0]))
+        absdiff = np.abs(np.diff(nonzero))  # Calculate a[n+1] - a[n] for all n
+        
+        # Runs start and end where absdiff is 1
+        ranges = np.where(absdiff == 1)[0].reshape(-1, 2)
+        return ranges
     
     def determine_contact_patch(self, x_coords, interpenetration):
         """
@@ -131,32 +189,52 @@ class KpModel:
         # Get x-coordinates of contact points
         contact_x = x_coords[contact_indices]
         
-        # Calculate contact patch dimensions
-        x_min = np.min(contact_x)
-        x_max = np.max(contact_x)
+        # Find runs of non-zero interpenetration
+        runs = self.nonzero_runs(interpenetration)
         
-        # Calculate semi-axis in rolling direction (a)
-        a = (x_max - x_min) / 2
+        # Create contact patches for each run
+        contact_patches = []
         
-        # Calculate semi-axis in lateral direction (b) using Kik-Piotrowski formula
-        # This is a simplified approximation
-        max_penetration = np.max(interpenetration)
-        b = np.sqrt(4 * self.profiles.wheel_radius * max_penetration)
+        for run_start, run_end in runs:
+            # Calculate contact patch dimensions for this run
+            x_min = x_coords[run_start]
+            x_max = x_coords[run_end - 1]
+            
+            # Calculate semi-axis in rolling direction (a)
+            # Ensure a minimum value to avoid division by zero
+            a = max((x_max - x_min) / 2, 1e-6)  # Minimum value of 1 micron
+            
+            # Calculate center of contact patch
+            center_x = (x_max + x_min) / 2
+            
+            # Get maximum penetration in this run
+            max_penetration = np.max(interpenetration[run_start:run_end])
+            
+            # Calculate semi-axis in lateral direction (b) using Kik-Piotrowski formula
+            b = np.sqrt(4 * self.profiles.wheel_radius * max_penetration)
+            
+            # Calculate contact patch area
+            area = np.pi * a * b
+            
+            # Create contact patch dictionary
+            contact_patch = {
+                'a': a,
+                'b': b,
+                'area': area,
+                'center_x': center_x,
+                'max_penetration': max_penetration,
+                'contact_indices': np.arange(run_start, run_end),
+                'run_start': run_start,
+                'run_end': run_end
+            }
+            
+            contact_patches.append(contact_patch)
         
-        # Calculate contact patch area
-        area = np.pi * a * b
-        
-        # Create contact patch dictionary
-        contact_patch = {
-            'a': a,
-            'b': b,
-            'area': area,
-            'center_x': (x_max + x_min) / 2,
-            'max_penetration': max_penetration,
-            'contact_indices': contact_indices
-        }
-        
-        return contact_patch
+        # For simplicity, return the patch with the largest penetration
+        if contact_patches:
+            return max(contact_patches, key=lambda x: x['max_penetration'])
+        else:
+            return None
     
     def calculate_pressure_distribution(self, x_coords, interpenetration, contact_patch):
         """
@@ -175,27 +253,53 @@ class KpModel:
         # Initialize pressure array
         pressure = np.zeros_like(interpenetration)
         
-        # Calculate pressure only for contact points
-        contact_indices = contact_patch['contact_indices']
+        # Get contact patch information
+        run_start = contact_patch['run_start']
+        run_end = contact_patch['run_end']
+        max_penetration = contact_patch['max_penetration']
+        a = contact_patch['a']  # Semi-axis in rolling direction
         
-        # Calculate effective radius
-        R_eff = self.profiles.wheel_radius
+        # Convert units for pressure calculation
+        # Reference implementation uses mm, our implementation uses m
+        # Convert wheel_radius from m to mm for consistency with reference
+        wheel_radius_mm = self.profiles.wheel_radius * 1000.0
+        # Convert penetration from m to mm
+        penetration_mm = self.penetration * 1000.0
+        # Convert max_penetration from m to mm
+        max_penetration_mm = max_penetration * 1000.0
         
-        # Calculate maximum pressure using Kik-Piotrowski formula
-        E_star = self.material.E / (1 - self.material.nu**2)
-        max_pressure = E_star * np.sqrt(contact_patch['max_penetration'] / R_eff)
+        # Calculate coefficient for pressure calculation
+        # Using the formula from the reference implementation
+        # E is in MPa in the reference implementation, convert from Pa to MPa
+        E_MPa = self.material.E / 1e6
+        
+        # Calculate maximum pressure using the formula from the reference implementation
+        # This is based on equation 13 in the original article
+        # The result will be in MPa
+        max_pressure_MPa = 0.5 * np.pi * E_MPa * penetration_mm / (1.0 - self.material.nu**2) * np.sqrt(max_penetration_mm / wheel_radius_mm)
+        
+        # Convert max_pressure from MPa to Pa for consistency with our implementation
+        max_pressure = max_pressure_MPa * 1e6
         
         # Calculate semi-elliptical pressure distribution
-        for i in contact_indices:
-            x_rel = (x_coords[i] - contact_patch['center_x']) / contact_patch['a']
-            
-            # Semi-elliptical distribution in x-direction
-            if abs(x_rel) <= 1:
-                pressure[i] = max_pressure * np.sqrt(1 - x_rel**2)
+        for i in range(run_start, run_end):
+            if interpenetration[i] > 0:
+                # Calculate relative position in contact patch
+                # Avoid division by zero by ensuring a is not too small
+                if a > 1e-6:  # Check if a is large enough to avoid division issues
+                    x_rel = (x_coords[i] - contact_patch['center_x']) / a
+                    
+                    # Semi-elliptical distribution in x-direction
+                    if abs(x_rel) <= 1:
+                        pressure[i] = max_pressure * np.sqrt(1 - x_rel**2)
+                else:
+                    # If a is too small, use a simplified approach
+                    # Just set the pressure at this point to the maximum pressure
+                    pressure[i] = max_pressure
         
         # Calculate normal force by integrating pressure over contact area
-        # This is a simplified calculation
-        normal_force = np.sum(pressure) * (x_coords[1] - x_coords[0]) * 2 * contact_patch['b']
+        dx = x_coords[1] - x_coords[0]
+        normal_force = np.sum(pressure) * dx * 2 * contact_patch['b']
         
         return pressure, max_pressure, normal_force
     
@@ -238,7 +342,9 @@ class KpModel:
             'normal_force': self.normal_force,
             'pressure_distribution': self.pressure_distribution,
             'x_coords': x_coords,
-            'interpenetration': interpenetration
+            'interpenetration': interpenetration,
+            'wheel_profile_eq': wheel_profile_eq,
+            'rail_profile_eq': rail_profile_eq
         }
     
     def plot_results(self, results, save_path=None):
@@ -253,22 +359,51 @@ class KpModel:
             print("No contact detected. Nothing to plot.")
             return
         
-        fig, axs = plt.subplots(2, 1, figsize=(10, 8))
+        # Create figure with 3 subplots
+        fig, axs = plt.subplots(3, 1, figsize=(10, 12))
         
-        # Plot profiles and interpenetration
-        axs[0].plot(results['x_coords'], self.profiles.wheel_profile[:, 1], 'b-', label='Wheel')
-        axs[0].plot(results['x_coords'], self.profiles.rail_profile[:, 1], 'r-', label='Rail')
-        axs[0].set_title('Wheel-Rail Profiles')
-        axs[0].set_xlabel('Lateral position (m)')
-        axs[0].set_ylabel('Vertical position (m)')
+        # 1. Plot original profiles with correct scaling (mm)
+        # Convert to mm for better visualization if profiles are in m
+        scale_factor = 1000.0  # Convert from m to mm
+        
+        # Plot original wheel profile
+        wheel_x = self.profiles.wheel_profile[:, 0] * scale_factor
+        wheel_y = self.profiles.wheel_profile[:, 1] * scale_factor
+        axs[0].plot(wheel_x, wheel_y, 'b-', label='Wheel')
+        
+        # Plot original rail profile
+        rail_x = self.profiles.rail_profile[:, 0] * scale_factor
+        rail_y = self.profiles.rail_profile[:, 1] * scale_factor
+        axs[0].plot(rail_x, rail_y, 'r-', label='Rail')
+        
+        axs[0].set_title('Original Wheel-Rail Profiles')
+        axs[0].set_xlabel('Lateral position (mm)')
+        axs[0].set_ylabel('Vertical position (mm)')
         axs[0].legend()
+        axs[0].grid(True)
         
-        # Plot pressure distribution
-        axs[1].plot(results['x_coords'], results['pressure_distribution'], 'g-')
-        axs[1].set_title('Pressure Distribution')
-        axs[1].set_xlabel('Lateral position (m)')
-        axs[1].set_ylabel('Pressure (Pa)')
+        # Set equal aspect ratio to preserve shape
+        axs[0].set_aspect('equal')
+        
+        # 2. Plot equalized profiles used for contact calculation
+        x_eq = results['x_coords'] * scale_factor
+        wheel_y_eq = results['wheel_profile_eq'][:, 1] * scale_factor
+        rail_y_eq = results['rail_profile_eq'][:, 1] * scale_factor
+        
+        axs[1].plot(x_eq, wheel_y_eq, 'b--', label='Wheel (equalized)')
+        axs[1].plot(x_eq, rail_y_eq, 'r--', label='Rail (equalized)')
+        axs[1].set_title('Equalized Profiles for Contact Calculation')
+        axs[1].set_xlabel('Lateral position (mm)')
+        axs[1].set_ylabel('Vertical position (mm)')
+        axs[1].legend()
         axs[1].grid(True)
+        
+        # 3. Plot pressure distribution
+        axs[2].plot(x_eq, results['pressure_distribution'] / 1e6, 'g-')  # Convert to MPa
+        axs[2].set_title(f'Pressure Distribution (Max: {results["max_pressure"]/1e6:.2f} MPa)')
+        axs[2].set_xlabel('Lateral position (mm)')
+        axs[2].set_ylabel('Pressure (MPa)')
+        axs[2].grid(True)
         
         plt.tight_layout()
         
@@ -283,25 +418,59 @@ def example_usage():
     # Create simplified wheel and rail profiles
     # In a real application, these would be loaded from files
     
-    # Wheel profile (simplified circular arc)
-    x_wheel = np.linspace(-0.05, 0.05, 100)
-    R_wheel = 0.46  # 460 mm wheel radius
-    y_wheel = np.sqrt(R_wheel**2 - x_wheel**2) - R_wheel + 0.01  # Vertical offset
-    wheel_profile = np.column_stack((x_wheel, y_wheel))
+    import numpy as np
+    import os
     
-    # Rail profile (simplified flat surface with rounded corners)
-    x_rail = np.linspace(-0.05, 0.05, 100)
-    y_rail = np.zeros_like(x_rail)
-    # Add rounded corners
-    corner_indices = np.where(abs(x_rail) > 0.03)[0]
-    y_rail[corner_indices] = -0.001 * (abs(x_rail[corner_indices]) - 0.03)**2
-    rail_profile = np.column_stack((x_rail, y_rail))
+    def load_wheel_profile(file_path):
+        """Load wheel profile from file."""
+        data = np.loadtxt(file_path, delimiter=None, skiprows=1)
+        # Point z-axis upwards
+        data[:, 1] = -data[:, 1]
+        return data
+
+    def load_rail_profile(file_path):
+        """Load rail profile from file."""
+        data = np.loadtxt(file_path, delimiter=None, skiprows=1)
+        # Point z-axis upwards
+        data[:, 1] = -data[:, 1]
+        return data
+
+    # Create profiles directory if it doesn't exist
+    os.makedirs('profiles', exist_ok=True)
+    
+    # Check if profiles exist, if not create dummy profiles
+    wheel_file = 'profiles/S1002.wheel'
+    rail_file = 'profiles/uic60i00.rail'
+    
+    if not os.path.exists(wheel_file) or not os.path.exists(rail_file):
+        print("Profile files not found. Creating dummy profiles.")
+        # Create dummy wheel profile (circular arc)
+        wheel_radius = 0.46  # m
+        x_wheel = np.linspace(-0.05, 0.05, 100)
+        y_wheel = np.sqrt(wheel_radius**2 - x_wheel**2) - wheel_radius
+        wheel_profile = np.column_stack((x_wheel, y_wheel))
+        
+        # Create dummy rail profile (flat with rounded edges)
+        x_rail = np.linspace(-0.05, 0.05, 100)
+        y_rail = np.zeros_like(x_rail)
+        y_rail[x_rail < -0.03] = -0.01 * np.sqrt(1 - ((x_rail[x_rail < -0.03] + 0.03) / 0.02)**2)
+        y_rail[x_rail > 0.03] = -0.01 * np.sqrt(1 - ((x_rail[x_rail > 0.03] - 0.03) / 0.02)**2)
+        rail_profile = np.column_stack((x_rail, y_rail))
+        
+        # Save dummy profiles
+        os.makedirs('profiles', exist_ok=True)
+        np.savetxt(wheel_file, wheel_profile, header='Dummy wheel profile')
+        np.savetxt(rail_file, rail_profile, header='Dummy rail profile')
+    else:
+        # Load profiles
+        wheel_profile = load_wheel_profile(wheel_file)
+        rail_profile = load_rail_profile(rail_file)
     
     # Create profiles object
     profiles = WheelRailProfiles(
         wheel_profile=wheel_profile,
         rail_profile=rail_profile,
-        wheel_radius=R_wheel
+        wheel_radius=0.46  # 460 mm converted to m
     )
     
     # Create material properties
@@ -310,11 +479,15 @@ def example_usage():
         nu=0.28   # Poisson's ratio
     )
     
-    # Create Kp model
+    # Create Kp model with parameters matching the reference implementation
+    penetration = 0.0001  # 0.1 mm penetration in meters
+    virtual_penetration = 0.00018  # Virtual penetration in meters
+    
     kp_model = KpModel(
         profiles=profiles,
         material=material,
-        penetration=0.0001,  # 0.1 mm penetration
+        penetration=penetration,
+        virtual_penetration=virtual_penetration,
         yaw_angle=0.0,
         discretization=100
     )
@@ -322,15 +495,18 @@ def example_usage():
     # Run model
     results = kp_model.run()
     
-    # Print results
-    print(f"Contact patch dimensions: a = {results['contact_patch']['a']*1000:.2f} mm, b = {results['contact_patch']['b']*1000:.2f} mm")
-    print(f"Contact patch area: {results['contact_patch']['area']*1e6:.2f} mm²")
-    print(f"Maximum pressure: {results['max_pressure']/1e6:.2f} MPa")
-    print(f"Normal force: {results['normal_force']:.2f} N")
-    
-    # Plot results
-    kp_model.plot_results(results)
-    plt.show()
+    if results['contact_patch'] is not None:
+        # Print results
+        print(f"Contact patch dimensions: a = {results['contact_patch']['a']*1000:.2f} mm, b = {results['contact_patch']['b']*1000:.2f} mm")
+        print(f"Contact patch area: {results['contact_patch']['area']*1e6:.2f} mm²")
+        print(f"Maximum pressure: {results['max_pressure']/1e6:.2f} MPa")
+        print(f"Normal force: {results['normal_force']:.2f} N")
+        
+        # Plot results
+        kp_model.plot_results(results)
+        plt.show()
+    else:
+        print("No contact detected.")
 
 
 if __name__ == "__main__":
